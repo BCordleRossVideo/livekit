@@ -20,6 +20,7 @@ Deepgram produces two response shapes depending on the API used:
            },
            "is_final": true,
            "speech_final": true,
+           "from_finalize": false,
            "start": 0.5,
            "duration": 1.2,
            "metadata": {"request_id": "..."}
@@ -46,12 +47,19 @@ Deepgram produces two response shapes depending on the API used:
            "metadata": {"request_id": "..."}
        }
 
-This module converts both shapes into the normalized :class:`SpeechEvent` /
-:class:`SpeechData` types defined in ``types.py``.
+Finalization
+~~~~~~~~~~~~
+Following the Pipecat two-phase protocol, Deepgram's ``from_finalize``
+field in the live response confirms that the server acknowledged a
+``connection.finalize()`` call.  When a live result has both
+``is_final=true`` and ``from_finalize=true``, the normalizer confirms
+finalization and the resulting event will carry ``finalized=True``.
 
 Reference:
     https://developers.deepgram.com/docs/results
-    https://github.com/livekit/agents (livekit-plugins-deepgram)
+    https://developers.deepgram.com/docs/finalize
+    https://github.com/pipecat-ai/pipecat  (services/deepgram/stt.py)
+    https://github.com/livekit/agents       (livekit-plugins-deepgram)
 """
 
 from __future__ import annotations
@@ -67,7 +75,7 @@ from .types import (
 
 
 # ---------------------------------------------------------------------------
-# Live / streaming results
+# Stateless helpers — one-shot conversion of a single message
 # ---------------------------------------------------------------------------
 
 
@@ -76,6 +84,7 @@ def normalize_live_transcript(
     *,
     language: str = "en",
     start_time_offset: float = 0.0,
+    finalized: bool = False,
 ) -> SpeechEvent:
     """Convert a Deepgram live (streaming) ``Results`` message.
 
@@ -84,6 +93,8 @@ def normalize_live_transcript(
         language: Fallback language code when not detected by Deepgram.
         start_time_offset: Offset (seconds) added to all timestamps so they
             are relative to the session start.
+        finalized: Pass ``True`` when the two-phase finalization protocol
+            has been confirmed (see :class:`DeepgramNormalizer`).
 
     Returns:
         A :class:`SpeechEvent` of type ``INTERIM_TRANSCRIPT`` or
@@ -99,8 +110,14 @@ def normalize_live_transcript(
     channel: dict[str, Any] = data.get("channel", {})
     alternatives: list[dict[str, Any]] = channel.get("alternatives", [])
 
-    # Deepgram may report a detected language at the channel level.
-    detected_lang = channel.get("detected_language") or language
+    # Deepgram may report a detected language at the channel level or in
+    # the first alternative's ``languages`` list.
+    detected_lang: str | None = channel.get("detected_language")
+    if not detected_lang and alternatives:
+        langs = alternatives[0].get("languages", [])
+        if langs:
+            detected_lang = langs[0]
+    detected_lang = detected_lang or language
 
     speech_alternatives: list[SpeechData] = []
     for alt in alternatives:
@@ -141,6 +158,8 @@ def normalize_live_transcript(
                 confidence=alt.get("confidence", 0.0),
                 speaker_id=speaker_id,
                 is_final=is_final,
+                finalized=finalized and is_final,
+                result=data,
                 words=words if words else None,
             )
         )
@@ -154,11 +173,6 @@ def normalize_live_transcript(
     )
 
 
-# ---------------------------------------------------------------------------
-# Pre-recorded (REST) results
-# ---------------------------------------------------------------------------
-
-
 def normalize_prerecorded_transcript(
     data: dict[str, Any],
     *,
@@ -166,13 +180,17 @@ def normalize_prerecorded_transcript(
 ) -> SpeechEvent:
     """Convert a Deepgram pre-recorded (batch) transcription response.
 
+    Pre-recorded results are always final and finalized (the entire audio
+    has been processed).
+
     Args:
-        data: Full JSON response from the Deepgram
-              ``/v1/listen`` REST endpoint.
+        data: Full JSON response from the Deepgram ``/v1/listen`` REST
+              endpoint.
         language: Fallback language if auto-detection is not used.
 
     Returns:
-        A :class:`SpeechEvent` of type ``FINAL_TRANSCRIPT``.
+        A :class:`SpeechEvent` of type ``FINAL_TRANSCRIPT`` with
+        ``finalized=True``.
     """
     results: dict[str, Any] = data.get("results", {})
     channels: list[dict[str, Any]] = results.get("channels", [])
@@ -213,6 +231,8 @@ def normalize_prerecorded_transcript(
                     confidence=alt.get("confidence", 0.0),
                     speaker_id=speaker_id,
                     is_final=True,
+                    finalized=True,
+                    result=data,
                     words=words if words else None,
                 )
             )
@@ -222,3 +242,82 @@ def normalize_prerecorded_transcript(
         request_id=request_id,
         alternatives=speech_alternatives,
     )
+
+
+# ---------------------------------------------------------------------------
+# Stateful normalizer — manages the two-phase finalization protocol
+# ---------------------------------------------------------------------------
+
+
+class DeepgramNormalizer:
+    """Stateful normalizer that tracks the Pipecat two-phase finalization.
+
+    Usage::
+
+        norm = DeepgramNormalizer(language="en")
+
+        # On each WebSocket message:
+        event = norm.on_live_result(data)
+
+        # When VAD detects user stopped speaking:
+        norm.request_finalize()
+        await connection.finalize()   # tell Deepgram to flush
+
+    The ``finalized`` flag on the resulting :class:`SpeechData` will be set
+    automatically when the sequence ``request_finalize()`` →
+    ``from_finalize=True`` response is observed.
+    """
+
+    def __init__(
+        self,
+        *,
+        language: str = "en",
+        start_time_offset: float = 0.0,
+    ) -> None:
+        self._language = language
+        self._start_time_offset = start_time_offset
+        self._finalize_requested = False
+        self._finalize_pending = False
+
+    # -- Finalization state machine (mirrors Pipecat STTService) -----------
+
+    def request_finalize(self) -> None:
+        """Phase 1: caller asks to finalize (e.g. VAD user-stopped-speaking).
+
+        After calling this, send ``connection.finalize()`` to the Deepgram
+        WebSocket so the server flushes its buffer.
+        """
+        self._finalize_requested = True
+
+    def confirm_finalize(self) -> None:
+        """Phase 2: provider confirmed the finalize request."""
+        if self._finalize_requested:
+            self._finalize_pending = True
+            self._finalize_requested = False
+
+    # -- Message handler ---------------------------------------------------
+
+    def on_live_result(self, data: dict[str, Any]) -> SpeechEvent:
+        """Handle a live ``Results`` message from the Deepgram WebSocket.
+
+        Automatically detects the ``from_finalize`` flag to confirm
+        finalization.
+        """
+        is_final: bool = data.get("is_final", False)
+        from_finalize: bool = data.get("from_finalize", False)
+
+        if is_final and from_finalize:
+            self.confirm_finalize()
+
+        finalized = self._finalize_pending
+        event = normalize_live_transcript(
+            data,
+            language=self._language,
+            start_time_offset=self._start_time_offset,
+            finalized=finalized,
+        )
+
+        if finalized:
+            self._finalize_pending = False
+
+        return event

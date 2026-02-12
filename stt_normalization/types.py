@@ -1,18 +1,40 @@
 """Normalized transcript types for STT provider responses.
 
-These types mirror the LiveKit agents SDK's speech event model
-(see https://github.com/livekit/agents -> livekit/agents/stt/stt.py)
-and the LiveKit protocol's Transcription/TranscriptionSegment protobuf messages
-(see livekit_models.proto).
+These types combine the best of both normalization approaches:
+
+- **LiveKit agents SDK** (``livekit/agents/stt/stt.py``): Multiple
+  alternatives with per-alternative confidence and word-level timing.
+- **Pipecat** (``pipecat/frames/frames.py``): Two-phase finalization
+  protocol, ISO 8601 wall-clock timestamps, and raw result preservation.
 
 All STT providers (Speechmatics, Deepgram, etc.) should normalize their
 responses into these types so downstream consumers have a single interface.
+
+Consumer contract
+-----------------
+1. **Interim** (``is_final=False``): ephemeral, display-only. May be
+   replaced by later events.
+2. **Final, not finalized** (``is_final=True, finalized=False``): text is
+   stable but the utterance may not be complete.  Safe to accumulate.
+3. **Final + finalized** (``is_final=True, finalized=True``): the user is
+   done talking.  This is the trigger for downstream actions (e.g. send to
+   an LLM).
+4. ``result`` always carries the raw provider response for debugging or
+   provider-specific data (word timings, confidence, etc.).
+5. ``language`` may be ``None`` when the provider did not detect one.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum, unique
+from typing import Any
+
+
+def _now_iso8601() -> str:
+    """UTC timestamp with millisecond precision, matching Pipecat's ``time_now_iso8601()``."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
 @unique
@@ -28,7 +50,7 @@ class SpeechEventType(str, Enum):
 
 @dataclass
 class TimedWord:
-    """A single word with start/end timestamps (seconds)."""
+    """A single word with start/end timestamps (seconds from stream start)."""
 
     text: str
     start_time: float = 0.0
@@ -39,21 +61,31 @@ class TimedWord:
 class SpeechData:
     """A single transcription alternative.
 
-    Fields align with the LiveKit protocol's ``TranscriptionSegment``:
-      - language  -> TranscriptionSegment.language
-      - text      -> TranscriptionSegment.text
-      - start_time / end_time -> TranscriptionSegment.start_time / end_time
-      - confidence -> (no direct proto field; carried in-band)
-      - is_final  -> TranscriptionSegment.final
+    Merges LiveKit's rich per-alternative metadata (confidence, word timing)
+    with Pipecat's raw result preservation and ISO timestamp.
+
+    Fields mapped to LiveKit protocol ``TranscriptionSegment``:
+      - ``language``  -> ``TranscriptionSegment.language``
+      - ``text``      -> ``TranscriptionSegment.text``
+      - ``start_time`` / ``end_time`` -> ``TranscriptionSegment.start_time`` / ``end_time``
+      - ``is_final``  -> ``TranscriptionSegment.final``
+
+    Fields from Pipecat:
+      - ``timestamp`` -> ISO 8601 wall-clock time of normalization
+      - ``result``    -> raw, unmodified provider response object
+      - ``finalized`` -> two-phase finalization flag (see module docstring)
     """
 
-    language: str
+    language: str | None
     text: str
     start_time: float = 0.0
     end_time: float = 0.0
     confidence: float = 0.0
     speaker_id: str | None = None
     is_final: bool = False
+    finalized: bool = False
+    timestamp: str = field(default_factory=_now_iso8601)
+    result: Any = None
     words: list[TimedWord] | None = None
 
 
