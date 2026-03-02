@@ -1,24 +1,31 @@
 """STT normalization — convert provider-specific responses to a unified format.
 
+Transcript lifecycle::
+
+    PARTIAL  →  STABLE  →  FINAL
+    (interim)   (3 repeats)  (provider confirmed)
+
 Usage::
 
     from stt_normalization import (
         SpeechEvent,
         SpeechData,
-        SpeechEventType,
+        TranscriptType,
         normalize_speechmatics,
         normalize_deepgram,
     )
 
-    # Speechmatics streaming partial
-    event = normalize_speechmatics.normalize_partial_transcript(raw_msg)
+    # Stateful (recommended) — handles PARTIAL → STABLE promotion
+    sm_norm = normalize_speechmatics.SpeechmaticsNormalizer(language="en")
+    event = sm_norm.on_partial(raw_msg)   # PARTIAL or STABLE
+    event = sm_norm.on_final(raw_msg)     # FINAL
 
-    # Deepgram live result
-    event = normalize_deepgram.normalize_live_transcript(raw_msg)
+    dg_norm = normalize_deepgram.DeepgramNormalizer(language="en")
+    event = dg_norm.on_live_result(raw_msg)  # PARTIAL, STABLE, or FINAL
 
     # Both produce the same SpeechEvent type
     for alt in event.alternatives:
-        print(alt.text, alt.confidence)
+        print(alt.text, alt.transcript_type)
 """
 
 from .types import (
@@ -26,7 +33,9 @@ from .types import (
     SpeechData,
     SpeechEvent,
     SpeechEventType,
+    StabilityDetector,
     TimedWord,
+    TranscriptType,
 )
 
 from . import normalize_deepgram, normalize_speechmatics
@@ -36,7 +45,9 @@ __all__ = [
     "SpeechData",
     "SpeechEvent",
     "SpeechEventType",
+    "StabilityDetector",
     "TimedWord",
+    "TranscriptType",
     "normalize_deepgram",
     "normalize_speechmatics",
 ]

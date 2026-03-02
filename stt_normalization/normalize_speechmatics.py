@@ -2,37 +2,31 @@
 
 Speechmatics produces two kinds of transcript messages over its WebSocket:
 
-1. **AddPartialTranscript** (``ADD_PARTIAL_SEGMENT``) – interim/partial
-   results while the user is still speaking.  The payload looks like::
+1. **AddPartialTranscript** – interim results while the user is still
+   speaking.
+2. **AddTranscript** – final, immutable results once a segment is confirmed.
 
-       {
-           "metadata": {"start_time": 1.23, "end_time": 2.45},
-           "results": [
-               {"type": "word", "content": "hello", "start_time": 1.23, "end_time": 1.50},
-               ...
-           ]
-       }
+Both share this payload shape::
 
-2. **AddTranscript** (``ADD_SEGMENT``) – final results once a segment is
-   confirmed.  Same shape as above but considered immutable.
+    {
+        "metadata": {"start_time": 1.23, "end_time": 2.45},
+        "results": [
+            {"type": "word", "content": "hello",
+             "start_time": 1.23, "end_time": 1.50},
+            ...
+        ]
+    }
 
-Speechmatics also emits turn-level events (``START_OF_TURN`` /
-``END_OF_TURN``) and speaker diarization data.  When diarization is enabled
-the segment dicts include a ``speaker_id`` field (e.g. ``"S1"``).
+Transcript lifecycle
+~~~~~~~~~~~~~~~~~~~~
+The :class:`SpeechmaticsNormalizer` uses a :class:`StabilityDetector` to
+promote partials to stable after 3 consecutive identical texts:
 
-Finalization
-~~~~~~~~~~~~
-Following the Pipecat two-phase protocol, a Speechmatics segment with
-``is_eou: true`` (end-of-utterance) confirms finalization — but only
-when finalization was previously *requested* by the caller (typically in
-response to a VAD user-stopped-speaking event).  See
-``SpeechmaticsNormalizer.confirm_finalize_if_eou()`` and the state
-helpers ``request_finalize()`` / ``confirm_finalize()``.
+- ``AddPartialTranscript`` → **PARTIAL** (or **STABLE** after 3 repeats)
+- ``AddTranscript``        → **FINAL**
 
 Reference:
     https://docs.speechmatics.com/introduction/rt-api-ref
-    https://github.com/pipecat-ai/pipecat  (services/speechmatics/stt.py)
-    https://github.com/livekit/agents       (livekit-plugins-speechmatics)
 """
 
 from __future__ import annotations
@@ -44,195 +38,35 @@ from .types import (
     SpeechData,
     SpeechEvent,
     SpeechEventType,
+    StabilityDetector,
     TimedWord,
+    TranscriptType,
 )
 
 
 # ---------------------------------------------------------------------------
-# Stateless helpers — one-shot conversion of a single message
+# Stateless helpers — one-shot conversion (caller manages transcript type)
 # ---------------------------------------------------------------------------
 
 
-def normalize_partial_transcript(
+def normalize_transcript(
     data: dict[str, Any],
     *,
+    transcript_type: TranscriptType,
     language: str = "en",
     start_time_offset: float = 0.0,
 ) -> SpeechEvent:
-    """Convert a Speechmatics ``AddPartialTranscript`` message.
+    """Convert a Speechmatics transcript message to a :class:`SpeechEvent`.
 
     Args:
         data: Raw JSON dict from the Speechmatics WebSocket.
+        transcript_type: Whether this is PARTIAL, STABLE, or FINAL.
         language: Fallback language code if not present in the payload.
-        start_time_offset: Offset (seconds) to add to all timestamps so that
-            they are relative to the beginning of the session rather than the
-            beginning of the audio chunk.
-
-    Returns:
-        A :class:`SpeechEvent` with type ``INTERIM_TRANSCRIPT``.
+        start_time_offset: Offset (seconds) added to all timestamps.
     """
-    return _to_speech_event(
-        data,
-        is_final=False,
-        finalized=False,
-        language=language,
-        start_time_offset=start_time_offset,
-    )
-
-
-def normalize_final_transcript(
-    data: dict[str, Any],
-    *,
-    language: str = "en",
-    start_time_offset: float = 0.0,
-    finalized: bool = False,
-) -> SpeechEvent:
-    """Convert a Speechmatics ``AddTranscript`` message.
-
-    Args:
-        data: Raw JSON dict from the Speechmatics WebSocket.
-        language: Fallback language code if not present in the payload.
-        start_time_offset: Offset (seconds) to add to all timestamps.
-        finalized: Pass ``True`` when the two-phase finalization protocol
-            has been confirmed (see :class:`SpeechmaticsNormalizer`).
-
-    Returns:
-        A :class:`SpeechEvent` with type ``FINAL_TRANSCRIPT``.
-    """
-    return _to_speech_event(
-        data,
-        is_final=True,
-        finalized=finalized,
-        language=language,
-        start_time_offset=start_time_offset,
-    )
-
-
-def normalize_recognition_usage(audio_duration: float) -> SpeechEvent:
-    """Create a ``RECOGNITION_USAGE`` event for billing/metrics tracking.
-
-    Call this at the end of a turn or session with the total audio duration
-    that was processed.
-
-    Args:
-        audio_duration: Total audio processed in seconds.
-    """
-    return SpeechEvent(
-        type=SpeechEventType.RECOGNITION_USAGE,
-        recognition_usage=RecognitionUsage(audio_duration=audio_duration),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Stateful normalizer — manages the two-phase finalization protocol
-# ---------------------------------------------------------------------------
-
-
-class SpeechmaticsNormalizer:
-    """Stateful normalizer that tracks the Pipecat two-phase finalization.
-
-    Usage::
-
-        norm = SpeechmaticsNormalizer(language="en")
-
-        # On each WebSocket message:
-        if msg_type == "AddPartialTranscript":
-            event = norm.on_partial(data)
-        elif msg_type == "AddTranscript":
-            event = norm.on_final(data)
-
-        # When VAD detects user stopped speaking:
-        norm.request_finalize()
-
-    The ``finalized`` flag on the resulting :class:`SpeechData` will be set
-    automatically when the sequence ``request_finalize()`` →
-    ``is_eou: true`` segment → next final frame is observed.
-    """
-
-    def __init__(
-        self,
-        *,
-        language: str = "en",
-        start_time_offset: float = 0.0,
-    ) -> None:
-        self._language = language
-        self._start_time_offset = start_time_offset
-        self._finalize_requested = False
-        self._finalize_pending = False
-
-    # -- Finalization state machine (mirrors Pipecat STTService) -----------
-
-    def request_finalize(self) -> None:
-        """Phase 1: caller asks to finalize (e.g. VAD user-stopped-speaking)."""
-        self._finalize_requested = True
-
-    def confirm_finalize(self) -> None:
-        """Phase 2: provider confirmed end-of-utterance."""
-        if self._finalize_requested:
-            self._finalize_pending = True
-            self._finalize_requested = False
-
-    def confirm_finalize_if_eou(self, data: dict[str, Any]) -> None:
-        """Convenience: call ``confirm_finalize()`` when any result has ``is_eou``."""
-        results: list[dict[str, Any]] = data.get("results", [])
-        if any(r.get("is_eou", False) for r in results):
-            self.confirm_finalize()
-
-    # -- Message handlers --------------------------------------------------
-
-    def on_partial(self, data: dict[str, Any]) -> SpeechEvent:
-        """Handle ``AddPartialTranscript``."""
-        return normalize_partial_transcript(
-            data,
-            language=self._language,
-            start_time_offset=self._start_time_offset,
-        )
-
-    def on_final(self, data: dict[str, Any]) -> SpeechEvent:
-        """Handle ``AddTranscript``.
-
-        Checks for ``is_eou`` to confirm finalization, then marks the
-        resulting event accordingly.
-        """
-        self.confirm_finalize_if_eou(data)
-
-        finalized = self._finalize_pending
-        event = normalize_final_transcript(
-            data,
-            language=self._language,
-            start_time_offset=self._start_time_offset,
-            finalized=finalized,
-        )
-
-        if finalized:
-            self._finalize_pending = False
-
-        return event
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-
-def _to_speech_event(
-    data: dict[str, Any],
-    *,
-    is_final: bool,
-    finalized: bool,
-    language: str,
-    start_time_offset: float,
-) -> SpeechEvent:
-    event_type = (
-        SpeechEventType.FINAL_TRANSCRIPT
-        if is_final
-        else SpeechEventType.INTERIM_TRANSCRIPT
-    )
-
     metadata = data.get("metadata", {})
     results: list[dict[str, Any]] = data.get("results", [])
 
-    # Build full transcript text from word results.
     text_parts: list[str] = []
     words: list[TimedWord] = []
     for r in results:
@@ -250,25 +84,101 @@ def _to_speech_event(
 
     text = " ".join(text_parts)
 
-    # Speechmatics does not return a per-segment confidence; use 1.0 for
-    # final results and 0.0 for partials (following the LiveKit plugin
-    # convention).
-    confidence = 1.0 if is_final else 0.0
+    # Speechmatics does not return per-segment confidence; use 1.0 for
+    # final results and 0.0 for partials.
+    confidence = 1.0 if transcript_type == TranscriptType.FINAL else 0.0
 
     speech_data = SpeechData(
         language=data.get("language", language),
         text=text,
+        transcript_type=transcript_type,
         start_time=metadata.get("start_time", 0.0) + start_time_offset,
         end_time=metadata.get("end_time", 0.0) + start_time_offset,
         confidence=confidence,
         speaker_id=data.get("speaker", data.get("speaker_id", None)),
-        is_final=is_final,
-        finalized=finalized,
         result=data,
         words=words if words else None,
     )
 
     return SpeechEvent(
-        type=event_type,
+        type=SpeechEventType.TRANSCRIPT,
         alternatives=[speech_data],
+    )
+
+
+def normalize_recognition_usage(audio_duration: float) -> SpeechEvent:
+    """Create a ``RECOGNITION_USAGE`` event for billing/metrics tracking."""
+    return SpeechEvent(
+        type=SpeechEventType.RECOGNITION_USAGE,
+        recognition_usage=RecognitionUsage(audio_duration=audio_duration),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Stateful normalizer — tracks stability across partials
+# ---------------------------------------------------------------------------
+
+
+class SpeechmaticsNormalizer:
+    """Stateful normalizer with automatic PARTIAL → STABLE promotion.
+
+    Usage::
+
+        norm = SpeechmaticsNormalizer(language="en")
+
+        for msg_type, data in websocket_messages:
+            if msg_type == "AddPartialTranscript":
+                event = norm.on_partial(data)
+            elif msg_type == "AddTranscript":
+                event = norm.on_final(data)
+
+            print(event.alternatives[0].transcript_type)
+            # → PARTIAL, PARTIAL, STABLE, ..., FINAL
+    """
+
+    def __init__(
+        self,
+        *,
+        language: str = "en",
+        start_time_offset: float = 0.0,
+        stable_threshold: int = 3,
+    ) -> None:
+        self._language = language
+        self._start_time_offset = start_time_offset
+        self._detector = StabilityDetector(threshold=stable_threshold)
+
+    def on_partial(self, data: dict[str, Any]) -> SpeechEvent:
+        """Handle ``AddPartialTranscript``.
+
+        Returns a PARTIAL event, or STABLE if the same text has appeared
+        ``stable_threshold`` times in a row.
+        """
+        text = _extract_text(data)
+        transcript_type = self._detector.on_text(text, provider_is_final=False)
+
+        return normalize_transcript(
+            data,
+            transcript_type=transcript_type,
+            language=self._language,
+            start_time_offset=self._start_time_offset,
+        )
+
+    def on_final(self, data: dict[str, Any]) -> SpeechEvent:
+        """Handle ``AddTranscript``. Always returns a FINAL event."""
+        text = _extract_text(data)
+        transcript_type = self._detector.on_text(text, provider_is_final=True)
+
+        return normalize_transcript(
+            data,
+            transcript_type=transcript_type,
+            language=self._language,
+            start_time_offset=self._start_time_offset,
+        )
+
+
+def _extract_text(data: dict[str, Any]) -> str:
+    """Build transcript text from the ``results`` word list."""
+    results: list[dict[str, Any]] = data.get("results", [])
+    return " ".join(
+        r.get("content", "") for r in results if r.get("type") == "word"
     )
