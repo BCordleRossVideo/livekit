@@ -20,10 +20,15 @@ Both share this payload shape::
 Transcript lifecycle
 ~~~~~~~~~~~~~~~~~~~~
 The :class:`SpeechmaticsNormalizer` uses a :class:`StabilityDetector` to
-promote partials to stable after 3 consecutive identical texts:
+track word-level stability across consecutive partials:
 
-- ``AddPartialTranscript`` → **PARTIAL** (or **STABLE** after 3 repeats)
+- ``AddPartialTranscript`` → **PARTIAL** (or **STABLE** when every word
+  has survived 3+ consecutive partials in its position)
 - ``AddTranscript``        → **FINAL**
+
+Individual words become stable independently, so ``stable_text`` may
+contain a prefix like ``"hello"`` while the full ``text`` is
+``"hello world"`` (where ``"world"`` is still partial).
 
 Reference:
     https://docs.speechmatics.com/introduction/rt-api-ref
@@ -53,6 +58,7 @@ def normalize_transcript(
     data: dict[str, Any],
     *,
     transcript_type: TranscriptType,
+    stable_flags: list[bool] | None = None,
     language: str = "en",
     start_time_offset: float = 0.0,
 ) -> SpeechEvent:
@@ -61,28 +67,50 @@ def normalize_transcript(
     Args:
         data: Raw JSON dict from the Speechmatics WebSocket.
         transcript_type: Whether this is PARTIAL, STABLE, or FINAL.
+        stable_flags: Per-word stability flags from
+            :meth:`StabilityDetector.on_words`.  If ``None``, all words
+            inherit stability from *transcript_type* (stable if STABLE or
+            FINAL, not stable if PARTIAL).
         language: Fallback language code if not present in the payload.
         start_time_offset: Offset (seconds) added to all timestamps.
     """
     metadata = data.get("metadata", {})
     results: list[dict[str, Any]] = data.get("results", [])
 
-    text_parts: list[str] = []
+    word_texts: list[str] = []
     words: list[TimedWord] = []
+    word_idx = 0
     for r in results:
         if r.get("type") != "word":
             continue
         word_text = r.get("content", "")
-        text_parts.append(word_text)
+        word_texts.append(word_text)
+
+        if stable_flags is not None and word_idx < len(stable_flags):
+            is_stable = stable_flags[word_idx]
+        else:
+            is_stable = transcript_type in (TranscriptType.STABLE, TranscriptType.FINAL)
+
         words.append(
             TimedWord(
                 text=word_text,
                 start_time=r.get("start_time", 0.0) + start_time_offset,
                 end_time=r.get("end_time", 0.0) + start_time_offset,
+                is_stable=is_stable,
             )
         )
+        word_idx += 1
 
-    text = " ".join(text_parts)
+    text = " ".join(word_texts)
+
+    # Build stable_text from the leading run of stable words.
+    stable_parts: list[str] = []
+    for w in words:
+        if w.is_stable:
+            stable_parts.append(w.text)
+        else:
+            break
+    stable_text = " ".join(stable_parts)
 
     # Speechmatics does not return per-segment confidence; use 1.0 for
     # final results and 0.0 for partials.
@@ -92,6 +120,7 @@ def normalize_transcript(
         language=data.get("language", language),
         text=text,
         transcript_type=transcript_type,
+        stable_text=stable_text,
         start_time=metadata.get("start_time", 0.0) + start_time_offset,
         end_time=metadata.get("end_time", 0.0) + start_time_offset,
         confidence=confidence,
@@ -115,12 +144,12 @@ def normalize_recognition_usage(audio_duration: float) -> SpeechEvent:
 
 
 # ---------------------------------------------------------------------------
-# Stateful normalizer — tracks stability across partials
+# Stateful normalizer — tracks word-level stability across partials
 # ---------------------------------------------------------------------------
 
 
 class SpeechmaticsNormalizer:
-    """Stateful normalizer with automatic PARTIAL → STABLE promotion.
+    """Stateful normalizer with word-level PARTIAL → STABLE promotion.
 
     Usage::
 
@@ -132,8 +161,15 @@ class SpeechmaticsNormalizer:
             elif msg_type == "AddTranscript":
                 event = norm.on_final(data)
 
-            print(event.alternatives[0].transcript_type)
-            # → PARTIAL, PARTIAL, STABLE, ..., FINAL
+            alt = event.alternatives[0]
+            print(f"{alt.transcript_type}: {alt.stable_text!r} | {alt.text!r}")
+            # PARTIAL: '' | 'hell'
+            # PARTIAL: '' | 'hello'
+            # PARTIAL: '' | 'hello wo'
+            # PARTIAL: 'hello' | 'hello world'
+            # PARTIAL: 'hello' | 'hello world'
+            # STABLE:  'hello world' | 'hello world'
+            # FINAL:   'hello world' | 'hello world'
     """
 
     def __init__(
@@ -150,35 +186,38 @@ class SpeechmaticsNormalizer:
     def on_partial(self, data: dict[str, Any]) -> SpeechEvent:
         """Handle ``AddPartialTranscript``.
 
-        Returns a PARTIAL event, or STABLE if the same text has appeared
-        ``stable_threshold`` times in a row.
+        Returns a PARTIAL event (or STABLE once every word has stabilized).
+        Individual words may be stable even while the overall transcript
+        is still PARTIAL — check ``stable_text`` or per-word ``is_stable``.
         """
-        text = _extract_text(data)
-        transcript_type = self._detector.on_text(text, provider_is_final=False)
+        word_texts = _extract_words(data)
+        transcript_type, stable_flags = self._detector.on_words(word_texts)
 
         return normalize_transcript(
             data,
             transcript_type=transcript_type,
+            stable_flags=stable_flags,
             language=self._language,
             start_time_offset=self._start_time_offset,
         )
 
     def on_final(self, data: dict[str, Any]) -> SpeechEvent:
         """Handle ``AddTranscript``. Always returns a FINAL event."""
-        text = _extract_text(data)
-        transcript_type = self._detector.on_text(text, provider_is_final=True)
+        word_texts = _extract_words(data)
+        transcript_type, stable_flags = self._detector.on_words(
+            word_texts, final=True
+        )
 
         return normalize_transcript(
             data,
             transcript_type=transcript_type,
+            stable_flags=stable_flags,
             language=self._language,
             start_time_offset=self._start_time_offset,
         )
 
 
-def _extract_text(data: dict[str, Any]) -> str:
-    """Build transcript text from the ``results`` word list."""
+def _extract_words(data: dict[str, Any]) -> list[str]:
+    """Extract the list of word strings from a Speechmatics payload."""
     results: list[dict[str, Any]] = data.get("results", [])
-    return " ".join(
-        r.get("content", "") for r in results if r.get("type") == "word"
-    )
+    return [r.get("content", "") for r in results if r.get("type") == "word"]

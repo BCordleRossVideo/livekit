@@ -3,7 +3,12 @@
 Transcript lifecycle::
 
     PARTIAL  →  STABLE  →  FINAL
-    (interim)   (3 repeats)  (provider confirmed)
+    (interim)   (3 word repeats)  (provider confirmed)
+
+Stability is tracked per-word.  As the transcript grows, earlier words
+can become stable while the trailing edge is still partial.  Use
+``alt.stable_text`` for the stable prefix and ``alt.text`` for the full
+transcript including partial words.
 
 Usage::
 

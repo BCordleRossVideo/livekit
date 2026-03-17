@@ -31,9 +31,10 @@ Deepgram produces two response shapes:
 Transcript lifecycle
 ~~~~~~~~~~~~~~~~~~~~
 The :class:`DeepgramNormalizer` uses a :class:`StabilityDetector` to
-promote partials to stable after 3 consecutive identical texts:
+track word-level stability across consecutive partials:
 
-- ``is_final=false`` → **PARTIAL** (or **STABLE** after 3 repeats)
+- ``is_final=false`` → **PARTIAL** (or **STABLE** when every word has
+  survived 3+ consecutive partials in its position)
 - ``is_final=true``  → **FINAL**
 
 Pre-recorded results are always **FINAL**.
@@ -65,6 +66,7 @@ def normalize_live_transcript(
     data: dict[str, Any],
     *,
     transcript_type: TranscriptType,
+    stable_flags: list[bool] | None = None,
     language: str = "en",
     start_time_offset: float = 0.0,
 ) -> SpeechEvent:
@@ -73,6 +75,9 @@ def normalize_live_transcript(
     Args:
         data: Raw JSON dict received from the Deepgram WebSocket.
         transcript_type: Whether this is PARTIAL, STABLE, or FINAL.
+        stable_flags: Per-word stability flags from the detector.
+            Applied to the first alternative's words.  If ``None``,
+            all words inherit from *transcript_type*.
         language: Fallback language code when not detected by Deepgram.
         start_time_offset: Offset (seconds) added to all timestamps.
     """
@@ -90,6 +95,7 @@ def normalize_live_transcript(
         alternatives,
         detected_lang=detected_lang,
         transcript_type=transcript_type,
+        stable_flags=stable_flags,
         start_time_offset=start_time_offset,
         raw_result=data,
         fallback_start=data.get("start", 0.0),
@@ -112,7 +118,7 @@ def normalize_prerecorded_transcript(
 ) -> SpeechEvent:
     """Convert a Deepgram pre-recorded (batch) transcription response.
 
-    Pre-recorded results are always FINAL.
+    Pre-recorded results are always FINAL (all words stable).
 
     Args:
         data: Full JSON response from Deepgram ``/v1/listen``.
@@ -132,6 +138,7 @@ def normalize_prerecorded_transcript(
             channel.get("alternatives", []),
             detected_lang=detected_lang,
             transcript_type=TranscriptType.FINAL,
+            stable_flags=None,
             start_time_offset=0.0,
             raw_result=data,
             fallback_start=0.0,
@@ -146,12 +153,12 @@ def normalize_prerecorded_transcript(
 
 
 # ---------------------------------------------------------------------------
-# Stateful normalizer — tracks stability across partials
+# Stateful normalizer — tracks word-level stability across partials
 # ---------------------------------------------------------------------------
 
 
 class DeepgramNormalizer:
-    """Stateful normalizer with automatic PARTIAL → STABLE promotion.
+    """Stateful normalizer with word-level PARTIAL → STABLE promotion.
 
     Usage::
 
@@ -159,8 +166,8 @@ class DeepgramNormalizer:
 
         for msg in websocket_messages:
             event = norm.on_live_result(msg)
-            print(event.alternatives[0].transcript_type)
-            # → PARTIAL, PARTIAL, STABLE, ..., FINAL
+            alt = event.alternatives[0]
+            print(f"{alt.transcript_type}: {alt.stable_text!r} | {alt.text!r}")
     """
 
     def __init__(
@@ -177,19 +184,19 @@ class DeepgramNormalizer:
     def on_live_result(self, data: dict[str, Any]) -> SpeechEvent:
         """Handle a live ``Results`` message from the Deepgram WebSocket.
 
-        Automatically promotes PARTIAL → STABLE after ``stable_threshold``
-        consecutive identical texts, and returns FINAL when Deepgram's
+        Tracks word-level stability and returns FINAL when Deepgram's
         ``is_final`` flag is set.
         """
         provider_is_final: bool = data.get("is_final", False)
-        text = _extract_text(data)
-        transcript_type = self._detector.on_text(
-            text, provider_is_final=provider_is_final
+        word_texts = _extract_words(data)
+        transcript_type, stable_flags = self._detector.on_words(
+            word_texts, final=provider_is_final
         )
 
         return normalize_live_transcript(
             data,
             transcript_type=transcript_type,
+            stable_flags=stable_flags,
             language=self._language,
             start_time_offset=self._start_time_offset,
         )
@@ -200,13 +207,16 @@ class DeepgramNormalizer:
 # ---------------------------------------------------------------------------
 
 
-def _extract_text(data: dict[str, Any]) -> str:
-    """Pull the top transcript string from a Deepgram live result."""
+def _extract_words(data: dict[str, Any]) -> list[str]:
+    """Pull word strings from the first alternative of a Deepgram result."""
     channel: dict[str, Any] = data.get("channel", {})
     alts: list[dict[str, Any]] = channel.get("alternatives", [])
-    if alts:
-        return alts[0].get("transcript", "")
-    return ""
+    if not alts:
+        return []
+    return [
+        w.get("word", w.get("punctuated_word", ""))
+        for w in alts[0].get("words", [])
+    ]
 
 
 def _build_alternatives(
@@ -214,6 +224,7 @@ def _build_alternatives(
     *,
     detected_lang: str,
     transcript_type: TranscriptType,
+    stable_flags: list[bool] | None,
     start_time_offset: float,
     raw_result: Any,
     fallback_start: float,
@@ -222,16 +233,30 @@ def _build_alternatives(
     """Build a list of :class:`SpeechData` from Deepgram alternatives."""
     speech_alternatives: list[SpeechData] = []
 
-    for alt in alternatives:
+    for alt_idx, alt in enumerate(alternatives):
         words_raw: list[dict[str, Any]] = alt.get("words", [])
-        words = [
-            TimedWord(
-                text=w.get("word", w.get("punctuated_word", "")),
-                start_time=w.get("start", 0.0) + start_time_offset,
-                end_time=w.get("end", 0.0) + start_time_offset,
+        words: list[TimedWord] = []
+        for i, w in enumerate(words_raw):
+            word_text = w.get("word", w.get("punctuated_word", ""))
+
+            # Apply per-word stability (only for the first alternative,
+            # since the detector tracks a single word sequence).
+            if stable_flags is not None and alt_idx == 0 and i < len(stable_flags):
+                is_stable = stable_flags[i]
+            else:
+                is_stable = transcript_type in (
+                    TranscriptType.STABLE,
+                    TranscriptType.FINAL,
+                )
+
+            words.append(
+                TimedWord(
+                    text=word_text,
+                    start_time=w.get("start", 0.0) + start_time_offset,
+                    end_time=w.get("end", 0.0) + start_time_offset,
+                    is_stable=is_stable,
+                )
             )
-            for w in words_raw
-        ]
 
         speaker_id: str | None = None
         if transcript_type == TranscriptType.FINAL and words_raw:
@@ -246,11 +271,21 @@ def _build_alternatives(
             seg_start = fallback_start + start_time_offset
             seg_end = seg_start + fallback_duration
 
+        # Build stable_text from the leading run of stable words.
+        stable_parts: list[str] = []
+        for w in words:
+            if w.is_stable:
+                stable_parts.append(w.text)
+            else:
+                break
+        stable_text = " ".join(stable_parts)
+
         speech_alternatives.append(
             SpeechData(
                 language=detected_lang,
                 text=alt.get("transcript", ""),
                 transcript_type=transcript_type,
+                stable_text=stable_text,
                 start_time=seg_start,
                 end_time=seg_end,
                 confidence=alt.get("confidence", 0.0),

@@ -7,13 +7,18 @@ Transcript lifecycle
 --------------------
 Each transcript passes through three states:
 
-1. **PARTIAL** — ephemeral interim result.  May be replaced by the next
-   partial.  Display-only; do not act on it.
-2. **STABLE** — three consecutive partials produced the same text,
-   so the transcript is unlikely to change.  Safe to accumulate or
-   display with confidence, but the user may still be mid-sentence.
+1. **PARTIAL** — ephemeral interim result.  At least one word has not yet
+   stabilized.  Display-only; do not act on it.
+2. **STABLE** — every word in the transcript has appeared in the same
+   position for 3 consecutive partials.  Safe to accumulate, but the
+   user may still be mid-sentence.
 3. **FINAL** — the provider has explicitly confirmed end-of-utterance.
    This is the trigger for downstream actions (e.g. send to an LLM).
+
+Stability is tracked **per-word**: as the transcript grows, earlier words
+can become stable while the trailing edge is still partial.
+``SpeechData.stable_text`` contains only the stable prefix, and each
+``TimedWord`` carries its own ``is_stable`` flag.
 
 The ``result`` field always carries the raw provider response for
 debugging or provider-specific data (word timings, per-word confidence,
@@ -54,11 +59,16 @@ class SpeechEventType(str, Enum):
 
 @dataclass
 class TimedWord:
-    """A single word with start/end timestamps (seconds from stream start)."""
+    """A single word with start/end timestamps (seconds from stream start).
+
+    ``is_stable`` indicates whether this word has survived enough
+    consecutive partials to be considered locked in.
+    """
 
     text: str
     start_time: float = 0.0
     end_time: float = 0.0
+    is_stable: bool = False
 
 
 @dataclass
@@ -72,6 +82,7 @@ class SpeechData:
     language: str | None
     text: str
     transcript_type: TranscriptType = TranscriptType.PARTIAL
+    stable_text: str = ""
     start_time: float = 0.0
     end_time: float = 0.0
     confidence: float = 0.0
@@ -107,58 +118,108 @@ class SpeechEvent:
 # Stability detector — shared by all provider normalizers
 # ---------------------------------------------------------------------------
 
-STABLE_THRESHOLD = 3  # consecutive identical partials required
+STABLE_THRESHOLD = 3  # consecutive partials a word must survive
+
+
+@dataclass
+class WordStability:
+    """Per-word tracking state (internal to StabilityDetector)."""
+
+    text: str
+    count: int = 1
+    is_stable: bool = False
 
 
 class StabilityDetector:
-    """Promotes a PARTIAL to STABLE after N consecutive identical texts.
+    """Word-level stability tracker.
 
-    Usage::
+    Tracks each word by position across consecutive partials.  A word
+    becomes **stable** once it has appeared in the same position for
+    ``threshold`` consecutive partials.  Once stable, a word stays
+    stable until the detector is reset (on FINAL).
 
-        detector = StabilityDetector()
+    The overall transcript is STABLE when *every* word is stable,
+    PARTIAL when at least one word is not yet stable, and FINAL when
+    the provider explicitly says so.
 
-        # On each provider message:
-        transcript_type = detector.on_text(text, provider_is_final=False)
-        # returns PARTIAL or STABLE
+    Example::
 
-        # When the provider flags a result as final:
-        transcript_type = detector.on_text(text, provider_is_final=True)
-        # returns FINAL and resets the counter
+        detector = StabilityDetector(threshold=3)
+
+        detector.on_words(["hell"])                   # → PARTIAL  stable=[]
+        detector.on_words(["hello"])                   # → PARTIAL  stable=[]
+        detector.on_words(["hello", "wo"])             # → PARTIAL  stable=[]
+        detector.on_words(["hello", "world"])          # → PARTIAL  stable=["hello"]
+        detector.on_words(["hello", "world"])          # → PARTIAL  stable=["hello"]
+        detector.on_words(["hello", "world"])          # → STABLE   stable=["hello", "world"]
+        detector.on_words(["hello", "world", "how"])   # → PARTIAL  stable=["hello", "world"]
+        detector.on_words(["hello", "world"], final=True)  # → FINAL
     """
 
     def __init__(self, threshold: int = STABLE_THRESHOLD) -> None:
         self._threshold = threshold
-        self._last_text: str | None = None
-        self._repeat_count: int = 0
+        self._words: list[WordStability] = []
 
-    def on_text(self, text: str, *, provider_is_final: bool) -> TranscriptType:
-        """Determine the transcript type for *text*.
+    def on_words(
+        self,
+        words: list[str],
+        *,
+        final: bool = False,
+    ) -> tuple[TranscriptType, list[bool]]:
+        """Update stability state and return per-word flags.
 
         Args:
-            text: The transcribed text from the provider.
-            provider_is_final: ``True`` when the provider has flagged this
-                result as final / end-of-utterance.
+            words: The list of word strings from the current partial.
+            final: ``True`` when the provider flagged this as final.
 
         Returns:
-            ``FINAL`` if the provider says so, ``STABLE`` if the same text
-            has appeared ``threshold`` times in a row, otherwise ``PARTIAL``.
+            A tuple of ``(transcript_type, stable_flags)`` where
+            ``stable_flags[i]`` is ``True`` when word *i* is stable.
         """
-        if provider_is_final:
+        if final:
+            stable_flags = [True] * len(words)
             self._reset()
-            return TranscriptType.FINAL
+            return TranscriptType.FINAL, stable_flags
 
-        if text == self._last_text:
-            self._repeat_count += 1
-        else:
-            self._last_text = text
-            self._repeat_count = 1
+        new_state: list[WordStability] = []
 
-        if self._repeat_count >= self._threshold:
-            self._reset()
-            return TranscriptType.STABLE
+        for i, word in enumerate(words):
+            if i < len(self._words) and self._words[i].text == word:
+                # Same word in same position — increment or keep stable.
+                prev = self._words[i]
+                new_count = prev.count + 1
+                is_stable = prev.is_stable or new_count >= self._threshold
+                new_state.append(
+                    WordStability(text=word, count=new_count, is_stable=is_stable)
+                )
+            elif i < len(self._words) and self._words[i].is_stable:
+                # Position had a *different* stable word — word changed,
+                # so this is a correction; reset this position.
+                new_state.append(WordStability(text=word, count=1))
+            else:
+                # New position or word changed before becoming stable.
+                new_state.append(WordStability(text=word, count=1))
 
-        return TranscriptType.PARTIAL
+        self._words = new_state
+
+        stable_flags = [w.is_stable for w in self._words]
+        all_stable = bool(stable_flags) and all(stable_flags)
+
+        return (
+            TranscriptType.STABLE if all_stable else TranscriptType.PARTIAL,
+            stable_flags,
+        )
+
+    @property
+    def stable_prefix(self) -> list[str]:
+        """Return the longest leading run of stable words."""
+        result: list[str] = []
+        for w in self._words:
+            if w.is_stable:
+                result.append(w.text)
+            else:
+                break
+        return result
 
     def _reset(self) -> None:
-        self._last_text = None
-        self._repeat_count = 0
+        self._words = []
